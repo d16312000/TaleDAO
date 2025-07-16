@@ -7,12 +7,19 @@
 (define-constant ERR_INSUFFICIENT_TOKENS (err u105))
 (define-constant ERR_PROPOSAL_NOT_FOUND (err u106))
 (define-constant ERR_VOTING_STILL_ACTIVE (err u107))
+(define-constant ERR_PAYMENT_FAILED (err u108))
+(define-constant ERR_ALREADY_PURCHASED (err u109))
+(define-constant ERR_STORY_NOT_MONETIZED (err u110))
+(define-constant ERR_INSUFFICIENT_PAYMENT (err u111))
+(define-constant ERR_INVALID_PRICE (err u112))
+(define-constant ERR_WITHDRAWAL_FAILED (err u113))
 
 (define-fungible-token tale-token)
 
 (define-data-var story-counter uint u0)
 (define-data-var chapter-counter uint u0)
 (define-data-var proposal-counter uint u0)
+(define-data-var platform-fee-percentage uint u5)
 
 (define-map stories
   { story-id: uint }
@@ -21,7 +28,10 @@
     creator: principal,
     current-chapter: uint,
     is-active: bool,
-    created-at: uint
+    created-at: uint,
+    is-monetized: bool,
+    price-per-chapter: uint,
+    total-revenue: uint
   }
 )
 
@@ -64,6 +74,21 @@
   { contributions: uint }
 )
 
+(define-map chapter-purchases
+  { buyer: principal, story-id: uint, chapter-id: uint }
+  { purchased-at: uint, price-paid: uint }
+)
+
+(define-map story-revenue-shares
+  { story-id: uint, contributor: principal }
+  { share-percentage: uint, accumulated-earnings: uint }
+)
+
+(define-map creator-earnings
+  { creator: principal }
+  { total-earnings: uint, withdrawable-balance: uint }
+)
+
 (define-public (mint-tokens (amount uint) (recipient principal))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
@@ -85,7 +110,10 @@
         creator: tx-sender,
         current-chapter: u0,
         is-active: true,
-        created-at: stacks-block-height
+        created-at: stacks-block-height,
+        is-monetized: false,
+        price-per-chapter: u0,
+        total-revenue: u0
       }
     )
     (var-set story-counter story-id)
@@ -204,6 +232,118 @@
   )
 )
 
+(define-public (enable-story-monetization (story-id uint) (price-per-chapter uint))
+  (let
+    (
+      (story-data (unwrap! (map-get? stories { story-id: story-id }) ERR_STORY_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get creator story-data)) ERR_NOT_AUTHORIZED)
+    (asserts! (> price-per-chapter u0) ERR_INVALID_PRICE)
+    (asserts! (not (get is-monetized story-data)) ERR_STORY_NOT_FOUND)
+    (map-set stories
+      { story-id: story-id }
+      (merge story-data {
+        is-monetized: true,
+        price-per-chapter: price-per-chapter
+      })
+    )
+    (map-set story-revenue-shares
+      { story-id: story-id, contributor: tx-sender }
+      { share-percentage: u70, accumulated-earnings: u0 }
+    )
+    (ok true)
+  )
+)
+
+(define-public (purchase-chapter-access (story-id uint) (chapter-id uint))
+  (let
+    (
+      (story-data (unwrap! (map-get? stories { story-id: story-id }) ERR_STORY_NOT_FOUND))
+      (chapter-data (unwrap! (map-get? chapters { story-id: story-id, chapter-id: chapter-id }) ERR_CHAPTER_NOT_FOUND))
+      (price (get price-per-chapter story-data))
+      (existing-purchase (map-get? chapter-purchases { buyer: tx-sender, story-id: story-id, chapter-id: chapter-id }))
+    )
+    (asserts! (get is-monetized story-data) ERR_STORY_NOT_MONETIZED)
+    (asserts! (is-none existing-purchase) ERR_ALREADY_PURCHASED)
+    (asserts! (>= (stx-get-balance tx-sender) price) ERR_INSUFFICIENT_PAYMENT)
+    (try! (stx-transfer? price tx-sender (as-contract tx-sender)))
+    (map-set chapter-purchases
+      { buyer: tx-sender, story-id: story-id, chapter-id: chapter-id }
+      { purchased-at: stacks-block-height, price-paid: price }
+    )
+    (try! (distribute-chapter-revenue story-id price))
+    (ok true)
+  )
+)
+
+(define-private (distribute-chapter-revenue (story-id uint) (amount uint))
+  (let
+    (
+      (story-data (unwrap! (map-get? stories { story-id: story-id }) ERR_STORY_NOT_FOUND))
+      (creator (get creator story-data))
+      (platform-fee (/ (* amount (var-get platform-fee-percentage)) u100))
+      (creator-amount (- amount platform-fee))
+    )
+    (map-set stories
+      { story-id: story-id }
+      (merge story-data { total-revenue: (+ (get total-revenue story-data) amount) })
+    )
+    (let
+      (
+        (current-earnings (get-creator-earnings creator))
+      )
+      (map-set creator-earnings
+        { creator: creator }
+        {
+          total-earnings: (+ (get total-earnings current-earnings) creator-amount),
+          withdrawable-balance: (+ (get withdrawable-balance current-earnings) creator-amount)
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (withdraw-earnings)
+  (let
+    (
+      (earnings-data (get-creator-earnings tx-sender))
+      (withdrawable (get withdrawable-balance earnings-data))
+    )
+    (asserts! (> withdrawable u0) ERR_INSUFFICIENT_PAYMENT)
+    (try! (as-contract (stx-transfer? withdrawable tx-sender tx-sender)))
+    (map-set creator-earnings
+      { creator: tx-sender }
+      (merge earnings-data { withdrawable-balance: u0 })
+    )
+    (ok withdrawable)
+  )
+)
+
+(define-public (set-revenue-share (story-id uint) (contributor principal) (share-percentage uint))
+  (let
+    (
+      (story-data (unwrap! (map-get? stories { story-id: story-id }) ERR_STORY_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get creator story-data)) ERR_NOT_AUTHORIZED)
+    (asserts! (<= share-percentage u30) ERR_INVALID_PRICE)
+    (map-set story-revenue-shares
+      { story-id: story-id, contributor: contributor }
+      { share-percentage: share-percentage, accumulated-earnings: u0 }
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-platform-fee (new-fee-percentage uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (<= new-fee-percentage u20) ERR_INVALID_PRICE)
+    (var-set platform-fee-percentage new-fee-percentage)
+    (ok true)
+  )
+)
+
 (define-read-only (get-story (story-id uint))
   (map-get? stories { story-id: story-id })
 )
@@ -242,4 +382,39 @@
 
 (define-read-only (get-token-supply)
   (ft-get-supply tale-token)
+)
+
+(define-read-only (has-purchased-chapter (buyer principal) (story-id uint) (chapter-id uint))
+  (is-some (map-get? chapter-purchases { buyer: buyer, story-id: story-id, chapter-id: chapter-id }))
+)
+
+(define-read-only (get-chapter-purchase (buyer principal) (story-id uint) (chapter-id uint))
+  (map-get? chapter-purchases { buyer: buyer, story-id: story-id, chapter-id: chapter-id })
+)
+
+(define-read-only (get-revenue-share (story-id uint) (contributor principal))
+  (map-get? story-revenue-shares { story-id: story-id, contributor: contributor })
+)
+
+(define-read-only (get-creator-earnings (creator principal))
+  (default-to 
+    { total-earnings: u0, withdrawable-balance: u0 }
+    (map-get? creator-earnings { creator: creator })
+  )
+)
+
+(define-read-only (get-platform-fee-percentage)
+  (var-get platform-fee-percentage)
+)
+
+(define-read-only (get-story-revenue (story-id uint))
+  (let
+    (
+      (story-data (map-get? stories { story-id: story-id }))
+    )
+    (match story-data
+      story (some (get total-revenue story))
+      none
+    )
+  )
 )
