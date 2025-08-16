@@ -13,6 +13,11 @@
 (define-constant ERR_INSUFFICIENT_PAYMENT (err u111))
 (define-constant ERR_INVALID_PRICE (err u112))
 (define-constant ERR_WITHDRAWAL_FAILED (err u113))
+(define-constant ERR_INVALID_RATING (err u114))
+(define-constant ERR_ALREADY_RATED (err u115))
+(define-constant ERR_STORY_INCOMPLETE (err u116))
+(define-constant ERR_REVIEW_NOT_FOUND (err u117))
+(define-constant ERR_CANNOT_RATE_OWN_STORY (err u118))
 
 (define-fungible-token tale-token)
 
@@ -20,6 +25,7 @@
 (define-data-var chapter-counter uint u0)
 (define-data-var proposal-counter uint u0)
 (define-data-var platform-fee-percentage uint u5)
+(define-data-var review-counter uint u0)
 
 (define-map stories
   { story-id: uint }
@@ -87,6 +93,43 @@
 (define-map creator-earnings
   { creator: principal }
   { total-earnings: uint, withdrawable-balance: uint }
+)
+
+(define-map story-ratings
+  { story-id: uint, rater: principal }
+  { rating: uint, rated-at: uint }
+)
+
+(define-map story-reviews
+  { review-id: uint }
+  {
+    story-id: uint,
+    reviewer: principal,
+    rating: uint,
+    review-text: (string-utf8 500),
+    helpful-votes: uint,
+    created-at: uint
+  }
+)
+
+(define-map review-helpfulness
+  { review-id: uint, voter: principal }
+  { is-helpful: bool, voted-at: uint }
+)
+
+(define-map story-rating-summary
+  { story-id: uint }
+  {
+    total-ratings: uint,
+    total-score: uint,
+    average-rating: uint,
+    total-reviews: uint
+  }
+)
+
+(define-map user-review-reputation
+  { user: principal }
+  { helpful-reviews: uint, total-reviews: uint, reputation-score: uint }
 )
 
 (define-public (mint-tokens (amount uint) (recipient principal))
@@ -344,6 +387,140 @@
   )
 )
 
+(define-public (rate-story (story-id uint) (rating uint))
+  (let
+    (
+      (story-data (unwrap! (map-get? stories { story-id: story-id }) ERR_STORY_NOT_FOUND))
+      (existing-rating (map-get? story-ratings { story-id: story-id, rater: tx-sender }))
+      (current-summary (get-story-rating-summary-data story-id))
+    )
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_RATING)
+    (asserts! (> (get current-chapter story-data) u0) ERR_STORY_INCOMPLETE)
+    (asserts! (not (is-eq tx-sender (get creator story-data))) ERR_CANNOT_RATE_OWN_STORY)
+    (asserts! (is-none existing-rating) ERR_ALREADY_RATED)
+    (map-set story-ratings
+      { story-id: story-id, rater: tx-sender }
+      { rating: rating, rated-at: stacks-block-height }
+    )
+    (let
+      (
+        (new-total-ratings (+ (get total-ratings current-summary) u1))
+        (new-total-score (+ (get total-score current-summary) rating))
+        (new-average (/ (* new-total-score u100) new-total-ratings))
+      )
+      (map-set story-rating-summary
+        { story-id: story-id }
+        {
+          total-ratings: new-total-ratings,
+          total-score: new-total-score,
+          average-rating: new-average,
+          total-reviews: (get total-reviews current-summary)
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (write-review (story-id uint) (rating uint) (review-text (string-utf8 500)))
+  (let
+    (
+      (story-data (unwrap! (map-get? stories { story-id: story-id }) ERR_STORY_NOT_FOUND))
+      (review-id (+ (var-get review-counter) u1))
+      (existing-rating (map-get? story-ratings { story-id: story-id, rater: tx-sender }))
+      (current-summary (get-story-rating-summary-data story-id))
+      (user-reputation (get-user-review-reputation-data tx-sender))
+    )
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_RATING)
+    (asserts! (> (get current-chapter story-data) u0) ERR_STORY_INCOMPLETE)
+    (asserts! (not (is-eq tx-sender (get creator story-data))) ERR_CANNOT_RATE_OWN_STORY)
+    (map-set story-reviews
+      { review-id: review-id }
+      {
+        story-id: story-id,
+        reviewer: tx-sender,
+        rating: rating,
+        review-text: review-text,
+        helpful-votes: u0,
+        created-at: stacks-block-height
+      }
+    )
+    (var-set review-counter review-id)
+    (if (is-none existing-rating)
+      (begin
+        (map-set story-ratings
+          { story-id: story-id, rater: tx-sender }
+          { rating: rating, rated-at: stacks-block-height }
+        )
+        (let
+          (
+            (new-total-ratings (+ (get total-ratings current-summary) u1))
+            (new-total-score (+ (get total-score current-summary) rating))
+            (new-average (/ (* new-total-score u100) new-total-ratings))
+          )
+          (map-set story-rating-summary
+            { story-id: story-id }
+            {
+              total-ratings: new-total-ratings,
+              total-score: new-total-score,
+              average-rating: new-average,
+              total-reviews: (+ (get total-reviews current-summary) u1)
+            }
+          )
+        )
+      )
+      (map-set story-rating-summary
+        { story-id: story-id }
+        (merge current-summary { total-reviews: (+ (get total-reviews current-summary) u1) })
+      )
+    )
+    (map-set user-review-reputation
+      { user: tx-sender }
+      {
+        helpful-reviews: (get helpful-reviews user-reputation),
+        total-reviews: (+ (get total-reviews user-reputation) u1),
+        reputation-score: (get reputation-score user-reputation)
+      }
+    )
+    (ok review-id)
+  )
+)
+
+(define-public (mark-review-helpful (review-id uint) (is-helpful bool))
+  (let
+    (
+      (review-data (unwrap! (map-get? story-reviews { review-id: review-id }) ERR_REVIEW_NOT_FOUND))
+      (existing-vote (map-get? review-helpfulness { review-id: review-id, voter: tx-sender }))
+      (reviewer (get reviewer review-data))
+      (reviewer-reputation (get-user-review-reputation-data reviewer))
+    )
+    (asserts! (not (is-eq tx-sender reviewer)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-none existing-vote) ERR_ALREADY_VOTED)
+    (map-set review-helpfulness
+      { review-id: review-id, voter: tx-sender }
+      { is-helpful: is-helpful, voted-at: stacks-block-height }
+    )
+    (if is-helpful
+      (begin
+        (map-set story-reviews
+          { review-id: review-id }
+          (merge review-data { helpful-votes: (+ (get helpful-votes review-data) u1) })
+        )
+        (map-set user-review-reputation
+          { user: reviewer }
+          {
+            helpful-reviews: (+ (get helpful-reviews reviewer-reputation) u1),
+            total-reviews: (get total-reviews reviewer-reputation),
+            reputation-score: (+ (get reputation-score reviewer-reputation) u10)
+          }
+        )
+      )
+      true
+    )
+    (ok true)
+  )
+)
+
 (define-read-only (get-story (story-id uint))
   (map-get? stories { story-id: story-id })
 )
@@ -418,3 +595,44 @@
     )
   )
 )
+
+(define-read-only (get-story-rating (story-id uint) (rater principal))
+  (map-get? story-ratings { story-id: story-id, rater: rater })
+)
+
+(define-read-only (get-story-review (review-id uint))
+  (map-get? story-reviews { review-id: review-id })
+)
+
+(define-read-only (get-story-rating-summary (story-id uint))
+  (map-get? story-rating-summary { story-id: story-id })
+)
+
+(define-read-only (get-user-review-reputation (user principal))
+  (map-get? user-review-reputation { user: user })
+)
+
+(define-read-only (get-review-helpfulness (review-id uint) (voter principal))
+  (map-get? review-helpfulness { review-id: review-id, voter: voter })
+)
+
+(define-read-only (get-review-count)
+  (var-get review-counter)
+)
+
+(define-private (get-story-rating-summary-data (story-id uint))
+  (default-to
+    { total-ratings: u0, total-score: u0, average-rating: u0, total-reviews: u0 }
+    (map-get? story-rating-summary { story-id: story-id })
+  )
+)
+
+(define-private (get-user-review-reputation-data (user principal))
+  (default-to
+    { helpful-reviews: u0, total-reviews: u0, reputation-score: u0 }
+    (map-get? user-review-reputation { user: user })
+  )
+)
+
+
+
