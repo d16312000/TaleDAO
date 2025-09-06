@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/TaleDAO.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.collaboration-rewards]
+path = 'contracts/collaboration-rewards.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
